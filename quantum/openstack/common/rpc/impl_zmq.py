@@ -61,6 +61,9 @@ zmq_opts = [
     cfg.IntOpt('rpc_zmq_port_pub', default=9502,
                help='ZeroMQ fanout publisher port'),
 
+    cfg.IntOpt('rpc_zmq_port_push', default=9503,
+               help='ZeroMQ round-robin publisher port'),
+
     cfg.IntOpt('rpc_zmq_contexts', default=1,
                help='Number of ZeroMQ contexts, defaults to 1'),
 
@@ -422,6 +425,11 @@ class ZmqProxy(ZmqBaseReactor):
                       CONF.rpc_zmq_port_pub), zmq.PUB, bind=True)
         self.sockets.append(self.topic_proxy['fanout~'])
 
+        self.topic_proxy['publishers~'] = \
+            ZmqSocket("tcp://%s:%s" % (CONF.rpc_zmq_bind_address,
+                      CONF.rpc_zmq_port_push), zmq.PUSH, bind=True)
+        self.sockets.append(self.topic_proxy['publishers~'])
+
     def consume(self, sock):
         ipc_dir = CONF.rpc_zmq_ipc_dir
 
@@ -511,12 +519,16 @@ class Connection(rpc_common.Connection):
     """Manages connections and threads."""
 
     def __init__(self, conf):
+        self.reactors = []
+
         self.reactor = ZmqReactor(conf)
+        self.reactors.append(self.reactor)
 
     def _consume_fanout(self, reactor, topic, proxy, bind=False):
         for topic, host in matchmaker.queues("publishers~%s" % (topic, )):
-            inaddr = "tcp://%s:%s" % (host, CONF.rpc_zmq_port)
+            inaddr = "tcp://%s:%s" % (host, CONF.rpc_zmq_port_pub)
             reactor.register(proxy, inaddr, zmq.SUB, in_bind=bind)
+            self.reactors.append(reactor)
 
     def declare_topic_consumer(self, topic, callback=None,
                                queue_name=None):
@@ -527,11 +539,14 @@ class Connection(rpc_common.Connection):
         # Only consume on the base topic name.
         topic = topic.split('.', 1)[0]
 
-        if CONF.rpc_zmq_host in matchmaker.queues("fanout~%s" % (topic, )):
+        if CONF.rpc_zmq_host in matchmaker.queues(topic):
             return
 
         reactor = CallbackReactor(CONF, callback)
-        self._consume_fanout(reactor, topic, None, bind=False)
+        for topic, host in matchmaker.queues("publishers~%s" % (topic, )):
+            inaddr = "tcp://%s:%s" % (host, CONF.rpc_zmq_port_push)
+            reactor.register(proxy, inaddr, zmq.PULL, in_bind=bind)
+        self.reactors.append(reactor)
 
     def create_consumer(self, topic, proxy, fanout=False):
         # Only consume on the base topic name.
@@ -573,13 +588,16 @@ class Connection(rpc_common.Connection):
                               subscribe=subscribe, in_bind=False)
 
     def close(self):
-        self.reactor.close()
+        for reactor in self.reactors:
+            reactor.close()
 
     def wait(self):
-        self.reactor.wait()
+        for reactor in self.reactors:
+            reactor.wait()
 
     def consume_in_thread(self):
-        self.reactor.consume_in_thread()
+        for reactor in self.reactors:
+            reactor.consume_in_thread()
 
 
 def _cast(addr, context, msg_id, topic, msg, timeout=None):
